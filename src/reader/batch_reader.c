@@ -203,6 +203,17 @@ struct carquet_batch_reader {
     /* Buffer pool for reuse across batches (one per projected column) */
     carquet_column_pool_t* col_pools;
 
+    /* Carry stash for the nested-list driver (read_nested_list_column):
+     * slots read past the last whole-list boundary of the previous batch.
+     * Without it, a slot-cap-truncated batch would split a list in two and
+     * corrupt every downstream row alignment (short lists + shifted rows).
+     * carry_n slots (def/rep) plus carry_present dense values (data). */
+    int16_t** nested_carry_def;    /* [num_projected] */
+    int16_t** nested_carry_rep;    /* [num_projected] */
+    uint8_t** nested_carry_data;   /* [num_projected] */
+    int64_t*  nested_carry_n;      /* [num_projected] stashed slots */
+    int64_t*  nested_carry_present;/* [num_projected] stashed dense values */
+
     /* Cached batch struct to avoid repeated alloc/free */
     carquet_row_batch_t* cached_batch;
 
@@ -712,28 +723,60 @@ static void read_nested_list_column(
         }
     }
 
-    /* Bound allocations. */
-    if (total_slots > 0 &&
-        value_size > CARQUET_MAX_BATCH_ALLOC / (size_t)total_slots) {
+    /* Bound allocations. Include the carry stash from the previous batch in
+     * the capacity estimate: the fresh read is placed after the carry slots
+     * (def/rep) and carry dense values (data), so the pools must cover both. */
+    int64_t carry_n = batch_reader->nested_carry_n[col_i];
+    int64_t carry_present = batch_reader->nested_carry_present[col_i];
+    if (carry_n < 0 || carry_present < 0) { *read_error = true; return; }
+    int64_t total_with_carry = total_slots + carry_n;
+    if (total_with_carry > 0 &&
+        value_size > CARQUET_MAX_BATCH_ALLOC / (size_t)total_with_carry) {
         *read_error = true;
         return;
     }
 
-    size_t slots_alloc = total_slots > 0 ? (size_t)total_slots : 1;
-    void* data = pool_ensure_data(pool, value_size * slots_alloc);
+    size_t slots_alloc = total_with_carry > 0 ? (size_t)total_with_carry : 1;
+    uint8_t* data = pool_ensure_data(pool, value_size * slots_alloc);
     int16_t* def_levels = pool_ensure_def_levels(pool, slots_alloc);
     int16_t* rep_levels = pool_ensure_rep_levels(pool, slots_alloc);
     if (!data || !def_levels || !rep_levels) { *read_error = true; return; }
 
+    /* Read the fresh slots BEHIND the carry: def/rep are slot-aligned (carry
+     * occupies the first carry_n entries), the dense value array is compacted
+     * (carry occupies the first carry_present entries). After the read, copy
+     * the carry in front so the batch is one contiguous slot stream. */
     int64_t slots = carquet_column_read_batch(
-        col_reader, data, total_slots, def_levels, rep_levels);
+        col_reader,
+        (uint8_t*)data + (size_t)carry_present * value_size,
+        total_slots,
+        def_levels + carry_n, rep_levels + carry_n);
     if (slots < 0) { *read_error = true; return; }
+    if (carry_n > 0) {
+        memcpy(data, batch_reader->nested_carry_data[col_i],
+               (size_t)carry_present * value_size);
+        memcpy(def_levels, batch_reader->nested_carry_def[col_i],
+               (size_t)carry_n * sizeof(int16_t));
+        memcpy(rep_levels, batch_reader->nested_carry_rep[col_i],
+               (size_t)carry_n * sizeof(int16_t));
+        slots += carry_n;
+        batch_reader->nested_carry_n[col_i] = 0;
+        batch_reader->nested_carry_present[col_i] = 0;
+    }
 
-    /* Trim to whole lists: if the last slot is mid-list (rep != 0), back up
-     * to the last rep==0 boundary so we don't split a list across batches.
-     * The column reader retains the unconsumed slots for the next call. */
+    /* Trim to whole lists: back up so the excess starts exactly at a list
+     * boundary (a rep==0 slot). Note rep_levels[t]==0 means slot t STARTS a
+     * new list — so slot t-1 is the END of the previous list. Backing up
+     * only until rep_levels[t-1]==0 (a list start) would be wrong: that
+     * would keep the list's first element here and carry its tail. */
     int64_t trim_slots = slots;
-    while (trim_slots > 0 && rep_levels[trim_slots - 1] != 0) {
+    while (trim_slots > 0) {
+        if (trim_slots == slots) {
+            if (rep_levels[trim_slots - 1] == 0) break;  /* ends on a complete list */
+            trim_slots--;
+            continue;
+        }
+        if (rep_levels[trim_slots] == 0) break;  /* excess starts a fresh list */
         trim_slots--;
     }
     /* If trim_slots == 0, the first list is larger than our slot cap.
@@ -741,16 +784,46 @@ static void read_nested_list_column(
     if (trim_slots == 0) {
         trim_slots = slots;  /* can't split — read all */
     }
-    /* If we trimmed, rewind the column reader by (slots - trim_slots). */
     if (trim_slots < slots) {
-        /* carquet_column_read_batch consumed `slots`; we only want trim_slots.
-         * Re-reading is not possible, so we must buffer the excess. Instead,
-         * we use a simple approach: only process trim_slots values, and push
-         * the remaining back by re-adding to values_remaining. */
-        /* TODO: proper rewind. For now, since avg_slots_per_row×2 safety
-         * margin makes mid-list splits extremely rare with uniform data,
-         * we process all slots and accept a slightly larger batch. */
-        trim_slots = slots;
+        int64_t excess = slots - trim_slots;
+        int16_t* cdef = carquet_mem_realloc(
+            batch_reader->nested_carry_def[col_i],
+            (size_t)excess * sizeof(int16_t));
+        int16_t* crep = carquet_mem_realloc(
+            batch_reader->nested_carry_rep[col_i],
+            (size_t)excess * sizeof(int16_t));
+        if (!cdef || !crep) { *read_error = true; return; }
+        batch_reader->nested_carry_def[col_i] = cdef;
+        batch_reader->nested_carry_rep[col_i] = crep;
+        memcpy(cdef, def_levels + trim_slots,
+               (size_t)excess * sizeof(int16_t));
+        memcpy(crep, rep_levels + trim_slots,
+               (size_t)excess * sizeof(int16_t));
+        /* Dense suffix: the present values belonging to the excess slots.
+         * They sit at the tail of the compacted value array; count them. */
+        int64_t excess_present = 0;
+        for (int64_t j = trim_slots; j < slots; j++) {
+            if (def_levels[j] == max_def) excess_present++;
+        }
+        uint8_t* cdata = carquet_mem_realloc(
+            batch_reader->nested_carry_data[col_i],
+            (size_t)excess_present * value_size);
+        if (!cdata) { *read_error = true; return; }
+        batch_reader->nested_carry_data[col_i] = cdata;
+        /* Pass 3 has not run yet — the dense values for the excess slots are
+         * still in their original dense positions. The number of present
+         * values in [0, trim_slots) plus excess_present equals the total
+         * present count so far, so the excess dense suffix starts at
+         * (total present in trim range). */
+        int64_t trim_present = 0;
+        for (int64_t j = 0; j < trim_slots; j++) {
+            if (def_levels[j] == max_def) trim_present++;
+        }
+        memcpy(cdata, data + (size_t)trim_present * value_size,
+               (size_t)excess_present * value_size);
+        batch_reader->nested_carry_n[col_i] = excess;
+        batch_reader->nested_carry_present[col_i] = excess_present;
+        slots = trim_slots;
     }
 
     /* Pass 1: count lists (rep==0), child elements (def >= elem_exists). */
@@ -1062,16 +1135,17 @@ carquet_batch_reader_t* carquet_batch_reader_create(
     batch_reader->col_pools = carquet_mem_calloc(batch_reader->num_projected,
                                       sizeof(carquet_column_pool_t));
     if (!batch_reader->col_pools) {
-        carquet_mem_free(batch_reader->projected_value_sizes);
-        carquet_mem_free(batch_reader->projected_max_reps);
-        carquet_mem_free(batch_reader->projected_max_defs);
-        carquet_mem_free(batch_reader->projected_type_lengths);
-        carquet_mem_free(batch_reader->projected_types);
-        carquet_mem_free(batch_reader->col_readers);
-        carquet_mem_free(batch_reader->projected_columns);
-        carquet_mem_free(batch_reader);
-        CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate buffer pool");
-        return NULL;
+        goto fail_alloc;
+    }
+    batch_reader->nested_carry_def = carquet_mem_calloc(batch_reader->num_projected, sizeof(int16_t*));
+    batch_reader->nested_carry_rep = carquet_mem_calloc(batch_reader->num_projected, sizeof(int16_t*));
+    batch_reader->nested_carry_data = carquet_mem_calloc(batch_reader->num_projected, sizeof(uint8_t*));
+    batch_reader->nested_carry_n = carquet_mem_calloc(batch_reader->num_projected, sizeof(int64_t));
+    batch_reader->nested_carry_present = carquet_mem_calloc(batch_reader->num_projected, sizeof(int64_t));
+    if (!batch_reader->nested_carry_def || !batch_reader->nested_carry_rep ||
+        !batch_reader->nested_carry_data || !batch_reader->nested_carry_n ||
+        !batch_reader->nested_carry_present) {
+        goto fail_alloc;
     }
 
     batch_reader->current_row_group = -1;
@@ -1270,6 +1344,24 @@ carquet_batch_reader_t* carquet_batch_reader_create(
     }
 
     return batch_reader;
+
+fail_alloc:
+    carquet_mem_free(batch_reader->projected_value_sizes);
+    carquet_mem_free(batch_reader->projected_max_reps);
+    carquet_mem_free(batch_reader->projected_max_defs);
+    carquet_mem_free(batch_reader->projected_type_lengths);
+    carquet_mem_free(batch_reader->projected_types);
+    carquet_mem_free(batch_reader->col_readers);
+    carquet_mem_free(batch_reader->projected_columns);
+    carquet_mem_free(batch_reader->col_pools);
+    carquet_mem_free(batch_reader->nested_carry_def);
+    carquet_mem_free(batch_reader->nested_carry_rep);
+    carquet_mem_free(batch_reader->nested_carry_data);
+    carquet_mem_free(batch_reader->nested_carry_n);
+    carquet_mem_free(batch_reader->nested_carry_present);
+    carquet_mem_free(batch_reader);
+    CARQUET_SET_ERROR(error, CARQUET_ERROR_OUT_OF_MEMORY, "Failed to allocate buffer pool");
+    return NULL;
 }
 
 static carquet_status_t open_row_group_readers(
@@ -2541,7 +2633,12 @@ static carquet_status_t batch_reader_next_nested(
     if (!need_advance) {
         need_advance = true;
         for (int32_t i = 0; i < batch_reader->num_projected; i++) {
-            if (carquet_column_has_next(batch_reader->col_readers[i])) {
+            /* A pending carry stash counts as unread data: the reader may be
+             * exhausted while the last (trimmed) list tail is still stashed. */
+            bool has_carry =
+                batch_reader->nested_carry_n[i] > 0;
+            if (carquet_column_has_next(batch_reader->col_readers[i]) ||
+                has_carry) {
                 need_advance = false;
                 break;
             }
@@ -3080,6 +3177,20 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
 
     /* Free per-reader task args */
     carquet_mem_free(batch_reader->task_args);
+
+    /* Free nested-list carry stashes */
+    if (batch_reader->nested_carry_def) {
+        for (int32_t i = 0; i < batch_reader->num_projected; i++) {
+            if (batch_reader->nested_carry_def[i]) carquet_mem_free(batch_reader->nested_carry_def[i]);
+            if (batch_reader->nested_carry_rep[i]) carquet_mem_free(batch_reader->nested_carry_rep[i]);
+            if (batch_reader->nested_carry_data[i]) carquet_mem_free(batch_reader->nested_carry_data[i]);
+        }
+        carquet_mem_free(batch_reader->nested_carry_def);
+        carquet_mem_free(batch_reader->nested_carry_rep);
+        carquet_mem_free(batch_reader->nested_carry_data);
+        carquet_mem_free(batch_reader->nested_carry_n);
+        carquet_mem_free(batch_reader->nested_carry_present);
+    }
 
     /* Destroy worker pool (only if we created it) */
     if (!batch_reader->pool_is_borrowed) {
