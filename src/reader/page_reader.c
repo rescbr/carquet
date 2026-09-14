@@ -19,6 +19,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
+#include <pthread.h>
+#include "worker_pool.h"
 
 #if defined(CARQUET_ARCH_ARM) && defined(CARQUET_ENABLE_NEON) && \
     (defined(__ARM_NEON) || defined(__ARM_NEON__))
@@ -27,6 +29,210 @@
 
 /* CRC32 verification */
 extern uint32_t carquet_crc32(const uint8_t* data, size_t length);
+
+/* ============================================================================
+ * Parallel page-decompression prefetch (mmap path, compressed V1 pages)
+ * ============================================================================
+ *
+ * Page decompression is the dominant per-file cost for compressed parquet
+ * (zstd ~1 GB/s single core) and was strictly serial: the consumer thread
+ * parsed a header, decompressed the payload, decoded it, repeated. Headers
+ * parse in microseconds; decompression is independent per page (the
+ * compressed bytes live in the stable mmap). So: while the consumer decodes
+ * page P, a shared worker pool decompresses P+1..P+K-1 into ring slots; the
+ * consumer then installs the matching slot as its decompress_buffer and
+ * skips the decompress call entirely.
+ *
+ * V2 data pages and the fread path are not prefetched (fall back inline).
+ * Slots are keyed by page header offset, so stale entries can never be
+ * mistaken for a match. */
+
+#define CARQUET_PF_SLOTS 8
+
+typedef struct carquet_page_prefetch carquet_page_prefetch_t;
+
+typedef struct pf_slot {
+    int state;               /* 0=empty 1=running 2=ready 3=failed */
+    int64_t page_offset;     /* header offset of the prefetched page */
+    uint8_t* buf;            /* owned; uncompressed_page_size bytes */
+    size_t size;             /* decompressed size (state 2) */
+    carquet_status_t status; /* decompress status (state 3) */
+} pf_slot_t;
+
+struct carquet_page_prefetch {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    pf_slot_t slots[CARQUET_PF_SLOTS];
+};
+
+typedef struct pf_job {
+    carquet_compression_t codec;
+    const uint8_t* src;      /* mmap — stable across the job's lifetime */
+    size_t src_size;
+    uint8_t* dst;
+    size_t cap;
+    carquet_page_prefetch_t* pf;
+    pf_slot_t* slot;
+} pf_job_t;
+
+/* Process-wide shared pool (created once, never torn down). Size is set
+ * via carquet_set_page_prefetch_threads() before first use (explicit
+ * configuration — carquet does not read environment variables from
+ * library code). */
+static pthread_once_t g_pf_once = PTHREAD_ONCE_INIT;
+static carquet_worker_pool_t* g_pf_pool;
+static int32_t g_pf_threads = 6;   /* default; clamp [1, 256] at init */
+
+void carquet_set_page_prefetch_threads(int32_t threads) {
+    if (threads >= 1 && threads <= 256) g_pf_threads = threads;
+}
+
+static void pf_pool_init(void) {
+    g_pf_pool = carquet_worker_pool_create(g_pf_threads);
+}
+static carquet_worker_pool_t* pf_pool(void) {
+    pthread_once(&g_pf_once, pf_pool_init);
+    return g_pf_pool;
+}
+
+static void pf_job_run(void* arg) {
+    pf_job_t* j = (pf_job_t*)arg;
+    size_t out = 0;
+    carquet_status_t st = carquet_decompress_page(
+        j->codec, j->src, j->src_size, j->dst, j->cap, &out);
+    pthread_mutex_lock(&j->pf->mu);
+    j->slot->size = out;
+    j->slot->status = st;
+    j->slot->state = (st == CARQUET_OK) ? 2 : 3;
+    pthread_cond_broadcast(&j->pf->cv);
+    pthread_mutex_unlock(&j->pf->mu);
+    carquet_mem_free(j);
+}
+
+/* Submit decompression of the next pages after `first_offset` (the page the
+ * consumer is about to load). Caller: the (single) consumer thread. */
+static void pf_kick(carquet_column_reader_t* reader, int64_t first_offset,
+                    int64_t values_budget) {
+    if (!reader->file_reader->mmap_data) return;
+    if (reader->col_meta->codec == CARQUET_COMPRESSION_UNCOMPRESSED) return;
+
+    if (!reader->pf) {
+        reader->pf = (carquet_page_prefetch_t*)carquet_mem_calloc(
+            1, sizeof(carquet_page_prefetch_t));
+        if (!reader->pf) return;
+        pthread_mutex_init(&reader->pf->mu, NULL);
+        pthread_cond_init(&reader->pf->cv, NULL);
+    }
+    carquet_page_prefetch_t* pf = reader->pf;
+
+    const uint8_t* mm = reader->file_reader->mmap_data;
+    const size_t fsz = reader->file_reader->file_size;
+
+    pthread_mutex_lock(&pf->mu);
+    /* Ring still covers ahead of the consumer — nothing to do. */
+    for (int i = 0; i < CARQUET_PF_SLOTS; ++i) {
+        if (pf->slots[i].state == 1 || pf->slots[i].state == 2) {
+            pthread_mutex_unlock(&pf->mu);
+            return;
+        }
+    }
+
+    int submitted = 0;
+    int64_t off = first_offset;
+    int64_t budget = values_budget;
+    while (submitted < CARQUET_PF_SLOTS && budget > 0) {
+        if (off < 0 || (size_t)off >= fsz) break;
+        parquet_page_header_t h;
+        size_t hsz;
+        carquet_error_t e = CARQUET_ERROR_INIT;
+        if (parquet_parse_page_header(mm + (size_t)off, fsz - (size_t)off,
+                                      &h, &hsz, &e) != CARQUET_OK) {
+            break;
+        }
+        const int64_t next = off + (int64_t)hsz + h.compressed_page_size;
+        if (h.type == CARQUET_PAGE_DICTIONARY) {
+            off = next;   /* skip — the consumer loads it inline when due */
+            continue;
+        }
+        if (h.type != CARQUET_PAGE_DATA) break;   /* V2: not prefetched */
+        if (h.data_page_header.num_values <= 0) break;
+
+        pf_slot_t* s = &pf->slots[submitted];
+        s->buf = (uint8_t*)carquet_mem_malloc((size_t)h.uncompressed_page_size);
+        if (!s->buf) break;
+        s->state = 1;
+        s->page_offset = off;
+        s->size = 0;
+        pf_job_t* j = (pf_job_t*)carquet_mem_malloc(sizeof(pf_job_t));
+        if (!j) {
+            carquet_mem_free(s->buf); s->buf = NULL; s->state = 0;
+            break;
+        }
+        j->codec = reader->col_meta->codec;
+        j->src = mm + (size_t)off + hsz;
+        j->src_size = (size_t)h.compressed_page_size;
+        j->dst = s->buf;
+        j->cap = (size_t)h.uncompressed_page_size;
+        j->pf = pf;
+        j->slot = s;
+        carquet_worker_pool_submit(pf_pool(), pf_job_run, j);
+
+        budget -= h.data_page_header.num_values;
+        off = next;
+        ++submitted;
+    }
+    pthread_mutex_unlock(&pf->mu);
+}
+
+/* If a prefetched buffer exists for `page_offset`, wait for it, take
+ * ownership of the buffer and return true. Failed slots return false
+ * (caller falls back to inline decompression). */
+static bool pf_take(carquet_column_reader_t* reader, int64_t page_offset,
+                    uint8_t** out, size_t* out_size) {
+    if (!reader->pf) return false;
+    carquet_page_prefetch_t* pf = reader->pf;
+    pthread_mutex_lock(&pf->mu);
+    for (int i = 0; i < CARQUET_PF_SLOTS; ++i) {
+        pf_slot_t* s = &pf->slots[i];
+        if (s->state != 0 && s->page_offset == page_offset) {
+            while (s->state == 1)
+                pthread_cond_wait(&pf->cv, &pf->mu);
+            bool ok = false;
+            if (s->state == 2) {
+                *out = s->buf;
+                *out_size = s->size;
+                s->buf = NULL;   /* ownership transferred to the reader */
+                ok = true;
+            }
+            if (s->buf) { carquet_mem_free(s->buf); s->buf = NULL; }
+            s->state = 0;
+            pthread_mutex_unlock(&pf->mu);
+            return ok;
+        }
+    }
+    pthread_mutex_unlock(&pf->mu);
+    return false;
+}
+
+void carquet_page_prefetch_destroy(carquet_column_reader_t* reader) {
+    if (!reader->pf) return;
+    carquet_page_prefetch_t* pf = reader->pf;
+    pthread_mutex_lock(&pf->mu);
+    for (int i = 0; i < CARQUET_PF_SLOTS; ++i) {
+        while (pf->slots[i].state == 1)
+            pthread_cond_wait(&pf->cv, &pf->mu);
+        if (pf->slots[i].buf) {
+            carquet_mem_free(pf->slots[i].buf);
+            pf->slots[i].buf = NULL;
+        }
+        pf->slots[i].state = 0;
+    }
+    pthread_mutex_unlock(&pf->mu);
+    pthread_mutex_destroy(&pf->mu);
+    pthread_cond_destroy(&pf->cv);
+    carquet_mem_free(pf);
+    reader->pf = NULL;
+}
 
 /* SIMD dispatch functions for dictionary gather */
 extern void carquet_dispatch_gather_i32(const int32_t* dict, const uint32_t* indices,
@@ -1774,6 +1980,16 @@ static carquet_status_t prepare_data_page_payload(
         return CARQUET_OK;
     }
 
+    /* Prefetched payload (installed into decompress_buffer by the caller):
+     * skip decompression. */
+    if (reader->page_predecompressed) {
+        reader->page_predecompressed = false;
+        *page_data = reader->decompress_buffer;
+        *page_size = (size_t)page_header->uncompressed_page_size;
+        *used_decompress_buffer = true;
+        return CARQUET_OK;
+    }
+
     status = ensure_decompress_capacity(
         reader, (size_t)page_header->uncompressed_page_size,
         "Failed to allocate decompress buffer", error);
@@ -2168,6 +2384,21 @@ static carquet_status_t load_next_page_mmap(
     /* Get pointer to page data in mmap */
     const uint8_t* page_data_ptr = header_ptr + header_size;
 
+    /* Prefetched (already-decompressed) payload for this page? Install it
+     * as the reader's decompress buffer; prepare_data_page_payload will
+     * skip decompression via the page_predecompressed flag. */
+    {
+        uint8_t* pre = NULL;
+        size_t pre_size = 0;
+        if (pf_take(reader, page_offset, &pre, &pre_size) && pre) {
+            if (reader->decompress_buffer)
+                carquet_mem_free(reader->decompress_buffer);
+            reader->decompress_buffer = pre;
+            reader->decompress_capacity = (size_t)page_header.uncompressed_page_size;
+            reader->page_predecompressed = true;
+        }
+    }
+
     /* Verify CRC32 if present */
     if (page_header.has_crc && file_reader->options.verify_checksums) {
         uint32_t computed_crc = carquet_crc32(page_data_ptr, page_header.compressed_page_size);
@@ -2350,6 +2581,12 @@ static carquet_status_t load_next_page_mmap(
     reader->page_values_read = 0;
     reader->page_header_size = (int32_t)header_size;
     reader->page_compressed_size = page_header.compressed_page_size;
+
+    /* Kick decompression of the following pages while the consumer decodes
+     * this one. Budget = values left in the chunk after this page. */
+    pf_kick(reader,
+            page_offset + (int64_t)header_size + page_header.compressed_page_size,
+            reader->values_remaining - (int64_t)decoded_count);
 
     return CARQUET_OK;
 }

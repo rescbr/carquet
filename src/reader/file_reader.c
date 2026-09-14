@@ -954,6 +954,7 @@ carquet_column_reader_t* carquet_reader_get_column(
 void carquet_column_reader_free(carquet_column_reader_t* reader) {
     if (!reader) return;
 
+    carquet_page_prefetch_destroy(reader);
     carquet_mem_free(reader->page_buffer);
     carquet_column_clear_retained_pages(reader);
     if (reader->dictionary_ownership == CARQUET_DATA_OWNED) {

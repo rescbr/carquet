@@ -1437,6 +1437,18 @@ CARQUET_API CARQUET_PURE CARQUET_NONNULL(1)
 int32_t carquet_reader_num_row_groups(const carquet_reader_t* reader);
 
 /**
+ * @brief Set the page-decompression prefetch pool size.
+ *
+ * Compressed (e.g. zstd) data pages are decompressed ahead of the consumer
+ * thread on a shared worker pool (mmap readers, V1 data pages only).
+ * Default: 6 threads. Must be called before the first reader is opened;
+ * later calls have no effect.
+ *
+ * @param[in] threads Pool size, clamped to [1, 256].
+ */
+CARQUET_API void carquet_set_page_prefetch_threads(int32_t threads);
+
+/**
  * @brief Get the number of columns in the file.
  *
  * @param[in] reader File reader

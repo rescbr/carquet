@@ -188,7 +188,18 @@ struct carquet_column_reader {
 
     /* Dictionary preservation mode */
     bool preserve_dictionary;   /* If true, skip materialization, keep indices */
+
+    /* Parallel page-decompression prefetch (mmap + compressed V1 pages).
+     * Upcoming pages' compressed payloads are decompressed on a shared
+     * worker pool ahead of the consumer thread; see page_reader.c. */
+    struct carquet_page_prefetch* pf;
+    bool page_predecompressed;  /* current page's decompress_buffer came
+                                 * from the prefetch ring — prepare_data_
+                                 * page_payload must skip decompression */
 };
+
+/* page_reader.c — drain + free the prefetch state of a column reader. */
+void carquet_page_prefetch_destroy(carquet_column_reader_t* reader);
 
 /* ============================================================================
  * Internal Functions
