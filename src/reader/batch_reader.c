@@ -89,6 +89,10 @@ typedef struct carquet_column_pool {
     size_t list_offsets_capacity; /* Capacity in elements */
     uint8_t* list_validity;     /* Pre-allocated list-level validity bitmap */
     size_t list_validity_capacity; /* Capacity in bytes */
+    uint8_t* spread_data;       /* Parallel-assembly output buffer (dense
+                                 * source stays in `data`; ranges write
+                                 * child-slot-positioned values here) */
+    size_t spread_capacity;     /* Capacity in bytes */
 } carquet_column_pool_t;
 
 struct carquet_row_batch {
@@ -344,6 +348,17 @@ static void* pool_ensure_data(carquet_column_pool_t* pool, size_t needed) {
     pool->data = carquet_mem_malloc(needed);
     pool->data_capacity = pool->data ? needed : 0;
     return pool->data;
+}
+
+/* Ensure the parallel-assembly spread buffer is at least 'needed' bytes. */
+static uint8_t* pool_ensure_spread(carquet_column_pool_t* pool, size_t needed) {
+    if (needed <= pool->spread_capacity) {
+        return pool->spread_data;
+    }
+    carquet_mem_free(pool->spread_data);
+    pool->spread_data = (uint8_t*)carquet_mem_malloc(needed);
+    pool->spread_capacity = pool->spread_data ? needed : 0;
+    return pool->spread_data;
 }
 
 static uint8_t* pool_ensure_bitmap(carquet_column_pool_t* pool, size_t needed) {
@@ -665,6 +680,103 @@ static void read_projected_column(
  *   - a rep==0 slot with def == 0 is a *null list* (only reachable when an
  *     optional ancestor sits above the repeated group).
  */
+/* ---- Parallel batch-assembly context for nested (list) columns ----
+ * see read_nested_list_column for the phased design. */
+enum { ASM_RANGES = 8 };
+typedef struct {
+    int64_t lists, children, present;
+    int null_list;
+} asm_acc_t;
+typedef struct asm_ctx {
+    const int16_t* def_levels;
+    const int16_t* rep_levels;
+    int16_t elem_exists, max_def;
+    int32_t* offsets;
+    uint8_t* list_valid;
+    uint8_t* child_valid;
+    const uint8_t* dense;      /* present-packed values (source) */
+    uint8_t* spread;           /* child-slot-positioned values (dest) */
+    size_t value_size;
+    int64_t slots;
+    asm_acc_t acc[ASM_RANGES];
+    int64_t list_base[ASM_RANGES];
+    int64_t child_base[ASM_RANGES];
+    int64_t present_base[ASM_RANGES];
+    int n_ranges;
+} asm_ctx_t;
+
+/* Phase A: per-range counts. */
+static void asm_phase_a(int64_t b, int64_t e, int32_t r, void* arg) {
+    asm_ctx_t* a = (asm_ctx_t*)arg;
+    int64_t lists = 0, children = 0, present = 0;
+    const int16_t* def = a->def_levels;
+    const int16_t* rep = a->rep_levels;
+    const int16_t ee = a->elem_exists;
+    const int16_t md = a->max_def;
+    for (int64_t j = b; j < e; ++j) {
+        if (rep[j] == 0) lists++;
+        if (def[j] >= ee) children++;
+        if (def[j] == md) present++;
+    }
+    a->acc[r].lists = lists;
+    a->acc[r].children = children;
+    a->acc[r].present = present;
+    a->acc[r].null_list = 0;
+}
+
+/* Phase C: offsets + list validity + dense→spread expansion, range-local. */
+static void asm_phase_c(int64_t b, int64_t e, int32_t r, void* arg) {
+    asm_ctx_t* a = (asm_ctx_t*)arg;
+    const int16_t* def = a->def_levels;
+    const int16_t* rep = a->rep_levels;
+    const int16_t ee = a->elem_exists;
+    const int16_t md = a->max_def;
+    const size_t vs = a->value_size;
+
+    /* Offsets + list validity. Lists may straddle range boundaries; each
+     * rep==0 slot belongs to exactly one range, so ownership is unique. */
+    int64_t li = a->list_base[r];
+    int64_t cc = 0;  /* children seen in this range before current list */
+    for (int64_t j = b; j < e; ++j) {
+        if (rep[j] == 0) {
+            a->offsets[li] = (int32_t)(a->child_base[r] + cc);
+            if (def[j] > 0) {
+                a->list_valid[li >> 3] |= (uint8_t)(1u << (li & 7));
+            } else {
+                a->acc[r].null_list = 1;
+            }
+            li++;
+        }
+        if (def[j] >= ee) cc++;
+    }
+
+    /* Expansion: back-to-front within the range, dense (present-packed)
+     * source → spread destination. Ranges never overlap in either space:
+     * child windows [child_base, +children) partition the child array and
+     * dense windows [present_base, +present) partition the dense array. */
+    int64_t ci = a->child_base[r] + a->acc[r].children - 1;
+    int64_t src = a->present_base[r] + a->acc[r].present - 1;
+    const uint8_t* dense = a->dense;
+    uint8_t* spread = a->spread;
+    uint8_t* child_valid = a->child_valid;
+    for (int64_t j = e - 1; j >= b; --j) {
+        if (def[j] < ee) continue;  /* not an element slot */
+        const int present = (def[j] == md);
+        uint8_t* dp = spread + (size_t)ci * vs;
+        if (present) {
+            const uint8_t* sp = dense + (size_t)src * vs;
+            memcpy(dp, sp, vs);
+            src--;
+            if (child_valid) {
+                child_valid[ci >> 3] |= (uint8_t)(1u << (ci & 7));
+            }
+        } else {
+            memset(dp, 0, vs);
+        }
+        ci--;
+    }
+}
+
 static void read_nested_list_column(
     carquet_batch_reader_t* batch_reader,
     carquet_row_batch_t* new_batch,
@@ -826,11 +938,50 @@ static void read_nested_list_column(
         slots = trim_slots;
     }
 
-    /* Pass 1: count lists (rep==0), child elements (def >= elem_exists). */
-    int64_t num_lists = 0, child_count = 0;
-    for (int64_t j = 0; j < trim_slots; j++) {
-        if (rep_levels[j] == 0) num_lists++;
-        if (def_levels[j] >= elem_exists) child_count++;
+    /* ---- Parallel batch assembly ----
+     * The three serial passes over every element slot (list counting,
+     * offsets/validity, dense→child-position expansion) were the dominant
+     * consumer-side cost for list<> columns (measured ~48% of a shard
+     * read). Restructured as: (A) parallel per-range counts, (B) serial
+     * prefix sums over the few ranges, (C) parallel per-range offset /
+     * validity writes + expansion into a dedicated spread buffer. The
+     * spread buffer is required for range safety: per-range child windows
+     * can overlap other ranges' dense source windows, so the old in-place
+     * back-to-front expansion is not parallelizable. */
+    enum { ASM_RANGES_UNUSED = 0 };
+    (void)ASM_RANGES_UNUSED;
+
+    asm_ctx_t A;
+    A.def_levels = def_levels;
+    A.rep_levels = rep_levels;
+    A.elem_exists = elem_exists;
+    A.max_def = max_def;
+    A.offsets = NULL;
+    A.list_valid = NULL;
+    A.child_valid = NULL;
+    A.dense = (const uint8_t*)data;
+    A.spread = NULL;
+    A.value_size = value_size;
+    A.slots = trim_slots;
+    A.n_ranges = ASM_RANGES;
+    memset(A.acc, 0, sizeof(A.acc));
+    memset(A.list_base, 0, sizeof(A.list_base));
+    memset(A.child_base, 0, sizeof(A.child_base));
+    memset(A.present_base, 0, sizeof(A.present_base));
+
+    /* Phase A: per-range counts (parallel). */
+    carquet_parallel_for(trim_slots, ASM_RANGES, asm_phase_a, &A);
+
+    /* Phase B: totals + range bases (serial, tiny). */
+    int64_t num_lists = 0, child_count = 0, present_total = 0;
+    int any_null = 0;
+    for (int r = 0; r < ASM_RANGES; ++r) {
+        A.list_base[r] = num_lists;
+        A.child_base[r] = child_count;
+        A.present_base[r] = present_total;
+        num_lists += A.acc[r].lists;
+        child_count += A.acc[r].children;
+        present_total += A.acc[r].present;
     }
     if (num_lists > INT32_MAX || child_count > INT32_MAX) {
         *read_error = true;
@@ -838,76 +989,55 @@ static void read_nested_list_column(
     }
     (void)expected_rows;  /* num_lists is authoritative; equals the RG row count */
 
-    col_data->data = data;
-    col_data->data_capacity = value_size * slots_alloc;
-    col_data->ownership = CARQUET_DATA_VIEW;
-    col_data->num_values = child_count;
-    col_data->num_lists = num_lists;
-
     /* Offsets buffer (num_lists + 1). */
     int32_t* offsets = pool_ensure_list_offsets(pool, (size_t)num_lists + 1);
     if (!offsets) { *read_error = true; return; }
     col_data->list_offsets = offsets;
 
-    /* List-level validity: only materialized if some list is null. */
+    /* List-level validity bitmap (materialized; published only when some
+     * list is null — same contract as before). */
     uint8_t* list_valid = pool_ensure_list_validity(pool, ((size_t)num_lists + 7) / 8 + 1);
     if (!list_valid) { *read_error = true; return; }
+    memset(list_valid, 0, ((size_t)num_lists + 7) / 8 + 1);
 
     /* Child-element validity: only needed when the element can be null. */
     uint8_t* child_valid = NULL;
     if (elem_optional) {
         child_valid = pool_ensure_bitmap(pool, ((size_t)child_count + 7) / 8 + 1);
         if (!child_valid) { *read_error = true; return; }
+        memset(child_valid, 0, ((size_t)child_count + 7) / 8 + 1);
     }
     col_data->null_bitmap = child_valid;
 
-    /* Pass 2: build offsets + list validity. */
-    int64_t li = -1, cc = 0;
-    bool any_list_null = false;
-    for (int64_t j = 0; j < slots; j++) {
-        if (rep_levels[j] == 0) {
-            li++;
-            offsets[li] = (int32_t)cc;
-            if (def_levels[j] > 0) {
-                list_valid[li >> 3] |= (uint8_t)(1u << (li & 7));
-            } else {
-                any_list_null = true;
-            }
-        }
-        if (def_levels[j] >= elem_exists) cc++;
-    }
-    offsets[num_lists] = (int32_t)cc;
-    col_data->list_validity = any_list_null ? list_valid : NULL;
-
-    /* Pass 3: expand dense (present-only) values into child-slot positions,
-     * back-to-front so it can run in place, and build child validity. The
-     * reader wrote `child_present` dense values at the front of `data`. */
+    /* Spread buffer for the child-slot-positioned values (dense source
+     * stays in `data`). */
+    uint8_t* spread = NULL;
     if (child_count > 0) {
-        int64_t child_present = 0;
-        for (int64_t j = 0; j < slots; j++) {
-            if (def_levels[j] == max_def) child_present++;
-        }
-        uint8_t* bytes = (uint8_t*)data;
-        /* child index for each element slot, walked back-to-front */
-        int64_t ci = child_count - 1;
-        int64_t src = child_present - 1;
-        for (int64_t j = slots - 1; j >= 0; j--) {
-            if (def_levels[j] < elem_exists) continue;  /* not an element */
-            bool present = (def_levels[j] == max_def);
-            uint8_t* dp = bytes + (size_t)ci * value_size;
-            if (present) {
-                uint8_t* sp = bytes + (size_t)src * value_size;
-                if (sp != dp) memmove(dp, sp, value_size);
-                src--;
-                if (child_valid) {
-                    child_valid[ci >> 3] |= (uint8_t)(1u << (ci & 7));
-                }
-            } else {
-                memset(dp, 0, value_size);
-            }
-            ci--;
-        }
+        spread = pool_ensure_spread(pool, (size_t)child_count * value_size + 1);
+        if (!spread) { *read_error = true; return; }
     }
+
+    /* Phase C (parallel): offsets + validity + expansion. */
+    A.offsets = offsets;
+    A.list_valid = list_valid;
+    A.child_valid = child_valid;
+    A.spread = spread;
+    carquet_parallel_for(trim_slots, ASM_RANGES, asm_phase_c, &A);
+
+    int any_list_null = 0;
+    for (int r = 0; r < ASM_RANGES; ++r)
+        any_list_null |= A.acc[r].null_list;
+
+    offsets[num_lists] = (int32_t)child_count;
+
+    col_data->data = child_count > 0 ? (void*)spread : data;
+    col_data->data_capacity = child_count > 0
+        ? (size_t)child_count * value_size
+        : value_size * slots_alloc;
+    col_data->ownership = CARQUET_DATA_VIEW;
+    col_data->num_values = child_count;
+    col_data->num_lists = num_lists;
+    col_data->list_validity = any_list_null ? list_valid : NULL;
 }
 
 /* ============================================================================
@@ -3216,6 +3346,7 @@ void carquet_batch_reader_free(carquet_batch_reader_t* batch_reader) {
             carquet_mem_free(batch_reader->col_pools[i].rep_levels);
             carquet_mem_free(batch_reader->col_pools[i].list_offsets);
             carquet_mem_free(batch_reader->col_pools[i].list_validity);
+            carquet_mem_free(batch_reader->col_pools[i].spread_data);
         }
         carquet_mem_free(batch_reader->col_pools);
     }

@@ -49,6 +49,16 @@ extern uint32_t carquet_crc32(const uint8_t* data, size_t length);
 
 #define CARQUET_PF_SLOTS 8
 
+/* Forward declarations (definitions later in this file). */
+carquet_status_t carquet_read_data_page_v1(
+    carquet_column_reader_t* reader,
+    const uint8_t* page_data, size_t page_size,
+    const parquet_data_page_header_t* header,
+    void* values, int64_t max_values,
+    int16_t* def_levels, int16_t* rep_levels,
+    int64_t* values_read, carquet_error_t* error);
+static size_t get_value_size(carquet_physical_type_t type, int32_t type_length);
+
 typedef struct carquet_page_prefetch carquet_page_prefetch_t;
 
 typedef struct pf_slot {
@@ -57,6 +67,14 @@ typedef struct pf_slot {
     uint8_t* buf;            /* owned; uncompressed_page_size bytes */
     size_t size;             /* decompressed size (state 2) */
     carquet_status_t status; /* decompress status (state 3) */
+    /* Full decode (gated: V1 + PLAIN + non-dictionary): the pool worker
+     * also ran level + value decode into slot-owned arrays, so the
+     * consumer installs them directly and skips the decode call. */
+    uint8_t* values;         /* num_values x value_size */
+    int16_t* def_levels;     /* num_values */
+    int16_t* rep_levels;     /* num_values */
+    int64_t values_read;
+    int decoded;             /* 1 when values/def/rep hold decoded page */
 } pf_slot_t;
 
 struct carquet_page_prefetch {
@@ -73,6 +91,13 @@ typedef struct pf_job {
     size_t cap;
     carquet_page_prefetch_t* pf;
     pf_slot_t* slot;
+    /* Full-decode parameters (filled by pf_kick; reader-immutable fields
+     * only — the consumer may concurrently use its reader for the page it
+     * is on, but never mutates these). */
+    int full_decode;         /* gate: V1 + PLAIN + !preserve_dictionary */
+    const carquet_column_reader_t* reader;  /* read-only params */
+    parquet_data_page_header_t header;      /* struct copy */
+    size_t value_size;
 } pf_job_t;
 
 /* Process-wide shared pool (created once, never torn down). Size is set
@@ -81,7 +106,7 @@ typedef struct pf_job {
  * library code). */
 static pthread_once_t g_pf_once = PTHREAD_ONCE_INIT;
 static carquet_worker_pool_t* g_pf_pool;
-static int32_t g_pf_threads = 6;   /* default; clamp [1, 256] at init */
+static int32_t g_pf_threads = 16;  /* default; clamp [1, 256] at init */
 
 void carquet_set_page_prefetch_threads(int32_t threads) {
     if (threads >= 1 && threads <= 256) g_pf_threads = threads;
@@ -100,6 +125,46 @@ static void pf_job_run(void* arg) {
     size_t out = 0;
     carquet_status_t st = carquet_decompress_page(
         j->codec, j->src, j->src_size, j->dst, j->cap, &out);
+    if (st == CARQUET_OK && j->full_decode) {
+        /* Level + value decode on the pool thread. carquet_read_data_page_v1
+         * is pure for the gated encodings: reader supplies only immutable
+         * schema parameters (type/widths/levels); the dictionary and
+         * DELTA_BYTE_ARRAY paths (which mutate reader state) are excluded
+         * by the gate. On decode failure fall back to decompress-only. */
+        pf_slot_t* s = j->slot;
+        const int32_t nv = j->header.num_values;
+        s->values = (uint8_t*)carquet_mem_malloc(
+            (size_t)nv * j->value_size + 1);
+        s->def_levels = (int16_t*)carquet_mem_malloc(
+            (size_t)nv * sizeof(int16_t) + 1);
+        s->rep_levels = (int16_t*)carquet_mem_malloc(
+            (size_t)nv * sizeof(int16_t) + 1);
+        if (s->values && s->def_levels && s->rep_levels) {
+            carquet_error_t de = CARQUET_ERROR_INIT;
+            int64_t vr = 0;
+            if (carquet_read_data_page_v1(
+                    (carquet_column_reader_t*)j->reader,
+                    j->dst, out, &j->header,
+                    s->values, nv, s->def_levels, s->rep_levels,
+                    &vr, &de) == CARQUET_OK) {
+                s->values_read = vr;
+                s->decoded = 1;
+                if (getenv("CARQUET_PF_DEBUG")) fprintf(stderr, "pf: pool decode ok nv=%d\n", nv);
+            } else {
+                if (getenv("CARQUET_PF_DEBUG"))
+                    fprintf(stderr, "pf: pool decode FAILED enc=%d err=%s\n",
+                            (int)j->header.encoding,
+                            de.message ? de.message : "?");
+                carquet_mem_free(s->values);   s->values = NULL;
+                carquet_mem_free(s->def_levels); s->def_levels = NULL;
+                carquet_mem_free(s->rep_levels); s->rep_levels = NULL;
+            }
+        } else {
+            carquet_mem_free(s->values);   s->values = NULL;
+            carquet_mem_free(s->def_levels); s->def_levels = NULL;
+            carquet_mem_free(s->rep_levels); s->rep_levels = NULL;
+        }
+    }
     pthread_mutex_lock(&j->pf->mu);
     j->slot->size = out;
     j->slot->status = st;
@@ -163,6 +228,8 @@ static void pf_kick(carquet_column_reader_t* reader, int64_t first_offset,
         s->state = 1;
         s->page_offset = off;
         s->size = 0;
+        s->decoded = 0;
+        s->values = NULL; s->def_levels = NULL; s->rep_levels = NULL;
         pf_job_t* j = (pf_job_t*)carquet_mem_malloc(sizeof(pf_job_t));
         if (!j) {
             carquet_mem_free(s->buf); s->buf = NULL; s->state = 0;
@@ -175,6 +242,24 @@ static void pf_kick(carquet_column_reader_t* reader, int64_t first_offset,
         j->cap = (size_t)h.uncompressed_page_size;
         j->pf = pf;
         j->slot = s;
+        /* Full-decode gate: FLAT (non-repeated) V1 PLAIN non-dictionary
+         * pages only. These are pure decodes (levels RLE + plain values) —
+         * the reader's mutable state (dictionary, retain list, indices
+         * staging) is not touched. list<> columns are EXCLUDED on purpose:
+         * their consumer-side batch assembly (offsets/validity over every
+         * element slot) dominates, and pushing the per-page decode through
+         * the shared pool made concurrent readers QUEUE behind each other's
+         * jobs (measured Lloyd 24.4s -> 31.9s); for those, decompress-only
+         * prefetch + engine-side shard parallelism is the right split. */
+        j->full_decode =
+            (h.data_page_header.encoding == CARQUET_ENCODING_PLAIN) &&
+            reader->max_rep_level == 0 && reader->max_def_level <= 1 &&
+            !reader->preserve_dictionary;
+        j->reader = reader;
+        j->header = h.data_page_header;
+        j->value_size = reader->preserve_dictionary
+            ? sizeof(uint32_t)
+            : get_value_size(reader->type, reader->type_length);
         carquet_worker_pool_submit(pf_pool(), pf_job_run, j);
 
         budget -= h.data_page_header.num_values;
@@ -184,13 +269,31 @@ static void pf_kick(carquet_column_reader_t* reader, int64_t first_offset,
     pthread_mutex_unlock(&pf->mu);
 }
 
+static void pf_clear_pending(carquet_column_reader_t* reader) {
+    if (reader->pf_pending_values)
+        carquet_mem_free(reader->pf_pending_values);
+    if (reader->pf_pending_def)
+        carquet_mem_free(reader->pf_pending_def);
+    if (reader->pf_pending_rep)
+        carquet_mem_free(reader->pf_pending_rep);
+    reader->pf_pending_decoded = 0;
+    reader->pf_pending_values = NULL;
+    reader->pf_pending_def = NULL;
+    reader->pf_pending_rep = NULL;
+    reader->pf_pending_values_read = 0;
+}
+
 /* If a prefetched buffer exists for `page_offset`, wait for it, take
- * ownership of the buffer and return true. Failed slots return false
- * (caller falls back to inline decompression). */
+ * ownership of the buffer (and decoded arrays, when present) and return
+ * true. Failed slots return false (caller falls back inline). */
 static bool pf_take(carquet_column_reader_t* reader, int64_t page_offset,
-                    uint8_t** out, size_t* out_size) {
+                    uint8_t** out, size_t* out_size,
+                    int* out_decoded, uint8_t** out_values,
+                    int16_t** out_def, int16_t** out_rep,
+                    int64_t* out_values_read) {
     if (!reader->pf) return false;
     carquet_page_prefetch_t* pf = reader->pf;
+    *out_decoded = 0;
     pthread_mutex_lock(&pf->mu);
     for (int i = 0; i < CARQUET_PF_SLOTS; ++i) {
         pf_slot_t* s = &pf->slots[i];
@@ -202,9 +305,20 @@ static bool pf_take(carquet_column_reader_t* reader, int64_t page_offset,
                 *out = s->buf;
                 *out_size = s->size;
                 s->buf = NULL;   /* ownership transferred to the reader */
+                if (s->decoded) {
+                    *out_decoded = 1;
+                    *out_values = s->values;
+                    *out_def = s->def_levels;
+                    *out_rep = s->rep_levels;
+                    *out_values_read = s->values_read;
+                    s->values = NULL; s->def_levels = NULL; s->rep_levels = NULL;
+                }
                 ok = true;
             }
             if (s->buf) { carquet_mem_free(s->buf); s->buf = NULL; }
+            if (s->values) { carquet_mem_free(s->values); s->values = NULL; }
+            if (s->def_levels) { carquet_mem_free(s->def_levels); s->def_levels = NULL; }
+            if (s->rep_levels) { carquet_mem_free(s->rep_levels); s->rep_levels = NULL; }
             s->state = 0;
             pthread_mutex_unlock(&pf->mu);
             return ok;
@@ -225,6 +339,9 @@ void carquet_page_prefetch_destroy(carquet_column_reader_t* reader) {
             carquet_mem_free(pf->slots[i].buf);
             pf->slots[i].buf = NULL;
         }
+        if (pf->slots[i].values) { carquet_mem_free(pf->slots[i].values); pf->slots[i].values = NULL; }
+        if (pf->slots[i].def_levels) { carquet_mem_free(pf->slots[i].def_levels); pf->slots[i].def_levels = NULL; }
+        if (pf->slots[i].rep_levels) { carquet_mem_free(pf->slots[i].rep_levels); pf->slots[i].rep_levels = NULL; }
         pf->slots[i].state = 0;
     }
     pthread_mutex_unlock(&pf->mu);
@@ -232,6 +349,98 @@ void carquet_page_prefetch_destroy(carquet_column_reader_t* reader) {
     pthread_cond_destroy(&pf->cv);
     carquet_mem_free(pf);
     reader->pf = NULL;
+}
+
+/* ============================================================================
+ * Fork-join parallel-for over the shared prefetch pool.
+ *
+ * Splits [0, n) into up to `ranges` contiguous subranges; range 0 runs on
+ * the CALLER thread (so its core is used, not idle-waited), the rest are
+ * submitted to the shared pool; returns when all complete. Falls back to a
+ * plain serial loop when the pool is unavailable or the work is small.
+ * Used by the nested-list batch assembly (offsets/validity/expansion passes
+ * over every element slot — the dominant consumer-side cost for list<>
+ * columns).
+ * ============================================================================ */
+
+typedef struct pf_for_task {
+    int64_t begin, end;
+    int32_t idx;
+    carquet_range_fn fn;
+    void* arg;
+    pthread_mutex_t* mu;
+    pthread_cond_t* cv;
+    int* remaining;
+} pf_for_task_t;
+
+static void pf_for_run(void* p) {
+    pf_for_task_t* t = (pf_for_task_t*)p;
+    t->fn(t->begin, t->end, t->idx, t->arg);
+    pthread_mutex_lock(t->mu);
+    if (--(*t->remaining) == 0)
+        pthread_cond_signal(t->cv);
+    pthread_mutex_unlock(t->mu);
+}
+
+void carquet_parallel_for(int64_t n, int32_t ranges, carquet_range_fn fn,
+                          void* arg) {
+    if (n <= 0) return;
+    if (ranges < 1) ranges = 1;
+    if (n < (int64_t)ranges * 4096) ranges = 1;
+
+    if (ranges == 1) {
+        fn(0, n, 0, arg);
+        return;
+    }
+
+    carquet_worker_pool_t* pool = pf_pool();
+    if (!pool) {
+        fn(0, n, 0, arg);
+        return;
+    }
+
+    pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+    int remaining = ranges - 1;   /* range 0 runs on the caller thread */
+
+    const int64_t per = (n + ranges - 1) / ranges;
+    for (int32_t r = 1; r < ranges; ++r) {
+        pf_for_task_t* t = (pf_for_task_t*)carquet_mem_malloc(sizeof(*t));
+        if (!t) {   /* degrade gracefully: run inline */
+            const int64_t b = r * per;
+            const int64_t e = (b + per < n) ? b + per : n;
+            fn(b, e, r, arg);
+            pthread_mutex_lock(&mu);
+            if (--remaining == 0) pthread_cond_signal(&cv);
+            pthread_mutex_unlock(&mu);
+            continue;
+        }
+        t->begin = (int64_t)r * per;
+        t->end = (t->begin + per < n) ? t->begin + per : n;
+        t->idx = r;
+        t->fn = fn;
+        t->arg = arg;
+        t->mu = &mu;
+        t->cv = &cv;
+        t->remaining = &remaining;
+        if (t->begin >= t->end) {
+            carquet_mem_free(t);
+            pthread_mutex_lock(&mu);
+            if (--remaining == 0) pthread_cond_signal(&cv);
+            pthread_mutex_unlock(&mu);
+            continue;
+        }
+        carquet_worker_pool_submit(pool, pf_for_run, t);
+    }
+
+    fn(0, per < n ? per : n, 0, arg);
+
+    pthread_mutex_lock(&mu);
+    while (remaining > 0)
+        pthread_cond_wait(&cv, &mu);
+    pthread_mutex_unlock(&mu);
+    pthread_mutex_destroy(&mu);
+    pthread_cond_destroy(&cv);
 }
 
 /* SIMD dispatch functions for dictionary gather */
@@ -2384,18 +2593,29 @@ static carquet_status_t load_next_page_mmap(
     /* Get pointer to page data in mmap */
     const uint8_t* page_data_ptr = header_ptr + header_size;
 
-    /* Prefetched (already-decompressed) payload for this page? Install it
-     * as the reader's decompress buffer; prepare_data_page_payload will
-     * skip decompression via the page_predecompressed flag. */
+    /* Prefetched (already-decompressed, possibly fully decoded) payload for
+     * this page? Install it as the reader's decompress buffer; stash any
+     * pool-decoded arrays for the decode point below. */
     {
         uint8_t* pre = NULL;
         size_t pre_size = 0;
-        if (pf_take(reader, page_offset, &pre, &pre_size) && pre) {
+        uint8_t* pvals = NULL;
+        int16_t* pdef = NULL;
+        int16_t* prep = NULL;
+        int64_t pvr = 0;
+        int pdec = 0;
+        if (pf_take(reader, page_offset, &pre, &pre_size,
+                    &pdec, &pvals, &pdef, &prep, &pvr) && pre) {
             if (reader->decompress_buffer)
                 carquet_mem_free(reader->decompress_buffer);
             reader->decompress_buffer = pre;
             reader->decompress_capacity = (size_t)page_header.uncompressed_page_size;
             reader->page_predecompressed = true;
+            reader->pf_pending_decoded = pdec;
+            reader->pf_pending_values = pvals;
+            reader->pf_pending_def = pdef;
+            reader->pf_pending_rep = prep;
+            reader->pf_pending_values_read = pvr;
         }
     }
 
@@ -2482,6 +2702,7 @@ static carquet_status_t load_next_page_mmap(
         reader->page_header_size = (int32_t)header_size;
         reader->page_compressed_size = page_header.compressed_page_size;
 
+        pf_clear_pending(reader);   /* early return — pool decode unused */
         return CARQUET_OK;
     }
 
@@ -2523,6 +2744,7 @@ static carquet_status_t load_next_page_mmap(
         reader->page_header_size = (int32_t)header_size;
         reader->page_compressed_size = page_header.compressed_page_size;
 
+        pf_clear_pending(reader);   /* early return — pool decode unused */
         return CARQUET_OK;
     }
 
@@ -2531,8 +2753,25 @@ static carquet_status_t load_next_page_mmap(
         return status;
     }
 
-    /* Decode the page */
+    /* Pool-decoded page: install the prefetched arrays, skip decode. */
     int64_t decoded_count;
+    if (reader->pf_pending_decoded) {
+        if (reader->decoded_ownership == CARQUET_DATA_OWNED)
+            carquet_mem_free(reader->decoded_values);
+        release_decoded_level_buffers(reader);
+        reader->decoded_values = reader->pf_pending_values;
+        reader->decoded_ownership = CARQUET_DATA_OWNED;
+        reader->decoded_capacity = (size_t)num_values;
+        reader->decoded_value_size = value_size;
+        reader->decoded_def_levels = reader->pf_pending_def;
+        reader->decoded_rep_levels = reader->pf_pending_rep;
+        decoded_count = reader->pf_pending_values_read;
+        reader->pf_pending_decoded = 0;
+        reader->pf_pending_values = NULL;
+        reader->pf_pending_def = NULL;
+        reader->pf_pending_rep = NULL;
+        reader->pf_pending_values_read = 0;
+    } else
     if (is_v2) {
         status = carquet_read_data_page_v2(
             reader, page_data, page_size,

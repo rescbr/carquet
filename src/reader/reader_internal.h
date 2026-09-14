@@ -196,10 +196,25 @@ struct carquet_column_reader {
     bool page_predecompressed;  /* current page's decompress_buffer came
                                  * from the prefetch ring — prepare_data_
                                  * page_payload must skip decompression */
+    /* Prefetched fully-decoded arrays for the page being loaded (installed
+     * as decoded_values/levels at the decode point; freed if an early
+     * zero-copy/view path returns first). */
+    int pf_pending_decoded;
+    uint8_t* pf_pending_values;
+    int16_t* pf_pending_def;
+    int16_t* pf_pending_rep;
+    int64_t pf_pending_values_read;
 };
 
 /* page_reader.c — drain + free the prefetch state of a column reader. */
 void carquet_page_prefetch_destroy(carquet_column_reader_t* reader);
+
+/* page_reader.c — fork-join parallel-for over the shared prefetch pool.
+ * Range 0 runs on the caller thread. Small work degrades to a serial call. */
+typedef void (*carquet_range_fn)(int64_t begin, int64_t end, int32_t range_idx,
+                                 void* arg);
+void carquet_parallel_for(int64_t n, int32_t ranges, carquet_range_fn fn,
+                          void* arg);
 
 /* ============================================================================
  * Internal Functions
